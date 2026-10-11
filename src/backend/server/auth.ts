@@ -13,7 +13,6 @@ import {
   generateTotpCode,
   verifyTotpCode,
   buildOtpauthUrl,
-  buildQrImageUrl,
 } from "../pkg/totp"
 import {
   listUserSshKeys,
@@ -758,11 +757,10 @@ authRouter.post("/2fa/generate", async (c) => {
   }
   const secret = generateTotpSecret()
   const otpauth = buildOtpauthUrl(secret, user.username)
-  const qr = await buildQrImageUrl(otpauth)
   return c.json({
     code: 200,
     message: "success",
-    data: { qr, secret },
+    data: { otpauth, secret },
   })
 })
 

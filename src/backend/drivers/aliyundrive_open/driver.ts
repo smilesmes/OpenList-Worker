@@ -147,8 +147,9 @@ export class AliyundriveOpen implements StorageDriver {
     const parentPath = "/" + parts.join("/")
 
     // 大文件自动走分片会话：整文件 putFile 会把整个 Buffer 交给单次 PUT，
-    // 受 Worker 内存与 CF 请求体限制。这里按 chunkSize 切分，复用同一套
-    // createUploadSession / uploadPart / completeUploadSession 链路。
+    // 受 Worker 内存与 CF 请求体限制。这里按 20MB 切分（与阿里云盘默认
+    // part size 一致），复用 createUploadSession / uploadPart /
+    // completeUploadSession 链路。hintChunkSize 不传，走驱动内部默认。
     const chunkSize = AliyunOpenClient.calPartSize(content.length)
     if (content.length > chunkSize) {
       const info = await this.client.createUploadSession(
@@ -190,7 +191,8 @@ export class AliyundriveOpen implements StorageDriver {
     physicalDir: string,
     fileName: string,
     size: number,
-    _md5: string,
+    md5: string,
+    hintChunkSize = 0,
   ): Promise<{
     reuse: boolean
     partCount: number
@@ -201,6 +203,7 @@ export class AliyundriveOpen implements StorageDriver {
       physicalDir || "/",
       fileName,
       size,
+      hintChunkSize,
     )
     return {
       reuse: info.reuse,

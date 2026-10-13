@@ -145,8 +145,87 @@ export class AliyundriveOpen implements StorageDriver {
     const parts = physicalPath.split("/").filter(Boolean)
     const name = parts.pop() || "upload"
     const parentPath = "/" + parts.join("/")
+
+    // 大文件自动走分片会话：整文件 putFile 会把整个 Buffer 交给单次 PUT，
+    // 受 Worker 内存与 CF 请求体限制。这里按 chunkSize 切分，复用同一套
+    // createUploadSession / uploadPart / completeUploadSession 链路。
+    const chunkSize = AliyunOpenClient.calPartSize(content.length)
+    if (content.length > chunkSize) {
+      const info = await this.client.createUploadSession(
+        parentPath,
+        name,
+        content.length,
+      )
+      if (!info.reuse) {
+        const partCount = Math.ceil(content.length / info.chunkSize)
+        for (let i = 0; i < partCount; i++) {
+          const start = i * info.chunkSize
+          const chunk = content.subarray(
+            start,
+            Math.min(start + info.chunkSize, content.length),
+          )
+          await this.client.uploadPart(info.session, i + 1, chunk)
+        }
+        await this.client.completeUploadSession(info.session)
+      }
+      return
+    }
+
     const parentId = await this.resolveFileId(parentPath)
     await this.client.putFile(parentId, name, content)
+  }
+
+  // ---- 分片会话上传（对齐上游 Go 版与 189/123Pan 驱动的接口形状）----
+  //
+  // 前端流程：
+  //   POST /api/fs/upload/create  -> { reuse, partCount, chunkSize, session }
+  //   PUT  /api/fs/upload/part    -> 逐片（header 带 X-Upload-Session / X-Part-Number）
+  //   POST /api/fs/upload/complete
+  //
+  // 关键：session 由 createUploadSession 序列化后交给前端带回，Worker 侧
+  // 不保留任何内存状态（无状态运行时，冷启动/换实例都不能丢会话）。
+
+  async createUploadSession(
+    _virtualDir: string,
+    physicalDir: string,
+    fileName: string,
+    size: number,
+    _md5: string,
+  ): Promise<{
+    reuse: boolean
+    partCount: number
+    chunkSize: number
+    session: string
+  }> {
+    const info = await this.client.createUploadSession(
+      physicalDir || "/",
+      fileName,
+      size,
+    )
+    return {
+      reuse: info.reuse,
+      partCount: info.partCount,
+      chunkSize: info.chunkSize,
+      session: info.session,
+    }
+  }
+
+  async uploadPart(
+    session: string,
+    partNumber: number,
+    content: Buffer,
+  ): Promise<{ partMd5: string }> {
+    await this.client.uploadPart(session, partNumber, content)
+    // 阿里云盘的 complete 不需要分片 MD5；返回空串保持接口形状一致，
+    // 避免上层把 undefined 传下去。
+    return { partMd5: "" }
+  }
+
+  async completeUploadSession(
+    session: string,
+    _partMd5s: string[] = [],
+  ): Promise<void> {
+    await this.client.completeUploadSession(session)
   }
 
   private async resolveFileId(physicalPath: string): Promise<string> {

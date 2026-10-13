@@ -378,4 +378,233 @@ export class AliyunOpenClient {
       upload_id: createResp.upload_id,
     })
   }
+
+  // ============================================================
+  // 分片上传（对齐上游 Go 版 drivers/aliyundrive_open/upload.go）
+  //
+  // 流程：create（一次性申请全部分片 URL）→ 逐片 PUT → complete
+  // 关键点（来自上游实现）：
+  //   - 分片大小由文件大小反推，默认 20MB，需保证片数 ≤ 10000
+  //   - complete 只需 drive_id / file_id / upload_id，不需要每片 MD5
+  //   - 分片 PUT 接受 200 与 409（409 表示该片已存在）
+  //   - 上传 URL 有时效，上游每 50 分钟重新申请一次
+  // ============================================================
+
+  /** 上游 calPartSize：默认 20MB，大文件按 10000 片上限反推 */
+  public static calPartSize(fileSize: number): number {
+    const MB = 1024 * 1024
+    const GB = 1024 * MB
+    const TB = 1024 * GB
+    let partSize = 20 * MB
+    if (fileSize > partSize) {
+      if (fileSize > 1 * TB) {
+        partSize = 5 * GB
+      } else if (fileSize > 768 * GB) {
+        partSize = 109951163
+      } else if (fileSize > 512 * GB) {
+        partSize = 82463373
+      } else if (fileSize > 384 * GB) {
+        partSize = 54975582
+      } else if (fileSize > 256 * GB) {
+        partSize = 41231687
+      } else if (fileSize > 128 * GB) {
+        partSize = 27487791
+      }
+    }
+    return partSize
+  }
+
+  /** 上游 makePartInfos：part_number 从 1 开始 */
+  private static makePartInfos(count: number): Array<{ part_number: number }> {
+    const list: Array<{ part_number: number }> = []
+    for (let i = 0; i < count; i++) {
+      list.push({ part_number: i + 1 })
+    }
+    return list
+  }
+
+  /**
+   * 创建分片上传会话。
+   *
+   * 返回的 session 是 Base64(JSON)，携带后续 uploadPart / complete 所需的
+   * 全部信息。Worker 无状态，会话必须由前端带回，因此这里序列化而非存内存。
+   */
+  public async createUploadSession(
+    physicalDir: string,
+    fileName: string,
+    size: number,
+  ): Promise<{
+    reuse: boolean
+    partCount: number
+    chunkSize: number
+    session: string
+    parentFileId: string
+  }> {
+    if (!this.driveId) {
+      await this.resolveDriveId()
+    }
+    const parentFileId = await this.resolveFolderId(physicalDir || "/")
+    const partSize = AliyunOpenClient.calPartSize(size)
+    const partCount = Math.max(1, Math.ceil(size / partSize))
+
+    const createResp = await this.openApiRequest<any>("/openFile/create", {
+      drive_id: this.driveId,
+      parent_file_id: parentFileId,
+      name: fileName,
+      type: "file",
+      size,
+      check_name_mode: "auto_rename",
+      part_info_list: AliyunOpenClient.makePartInfos(partCount),
+    })
+
+    // 秒传命中：阿里云盘直接返回 rapid_upload，无需再传分片
+    if (createResp?.rapid_upload === true) {
+      return {
+        reuse: true,
+        partCount: 0,
+        chunkSize: partSize,
+        session: "",
+        parentFileId,
+      }
+    }
+
+    const partInfoList: any[] = Array.isArray(createResp?.part_info_list)
+      ? createResp.part_info_list
+      : []
+    if (partInfoList.length === 0) {
+      throw new Error(
+        "[AliyundriveOpen] create did not return part_info_list; " +
+          "cannot start chunked upload",
+      )
+    }
+
+    const session = Buffer.from(
+      JSON.stringify({
+        driveId: this.driveId,
+        fileId: createResp.file_id,
+        uploadId: createResp.upload_id,
+        partCount: partInfoList.length,
+        chunkSize: partSize,
+        size,
+        // 上传 URL 一次性拿全，减少往返
+        uploadUrls: partInfoList.map((p: any) => String(p?.upload_url || "")),
+      }),
+      "utf8",
+    ).toString("base64")
+
+    return {
+      reuse: false,
+      partCount: partInfoList.length,
+      chunkSize: partSize,
+      session,
+      parentFileId,
+    }
+  }
+
+  /** 上传单个分片。partNumber 从 1 开始。 */
+  public async uploadPart(
+    sessionToken: string,
+    partNumber: number,
+    content: Buffer,
+  ): Promise<void> {
+    const session = this.decodeUploadSession(sessionToken)
+    if (
+      !Number.isInteger(partNumber) ||
+      partNumber < 1 ||
+      partNumber > session.partCount
+    ) {
+      throw new Error(`[AliyundriveOpen] 分片序号无效: ${partNumber}`)
+    }
+    const uploadUrl = session.uploadUrls[partNumber - 1]
+    if (!uploadUrl) {
+      throw new Error(
+        `[AliyundriveOpen] 分片 ${partNumber} 缺少上传地址，请重新发起上传`,
+      )
+    }
+    const res = await fetch(uploadUrl, {
+      method: "PUT",
+      body: content as any,
+    })
+    // 上游接受 200 与 409（409 = 该分片已存在，幂等重传时会出现）
+    if (res.status !== 200 && res.status !== 409) {
+      const text = await res.text().catch(() => "")
+      throw new Error(
+        `[AliyundriveOpen] 上传第 ${partNumber}/${session.partCount} 分片失败: HTTP ${res.status} ${text}`,
+      )
+    }
+  }
+
+  /** 完成上传会话。阿里云盘的 complete 不需要每片 MD5。 */
+  public async completeUploadSession(sessionToken: string): Promise<void> {
+    const session = this.decodeUploadSession(sessionToken)
+    await this.openApiRequest("/openFile/complete", {
+      drive_id: session.driveId,
+      file_id: session.fileId,
+      upload_id: session.uploadId,
+    })
+  }
+
+  private decodeUploadSession(token: string): {
+    driveId: string
+    fileId: string
+    uploadId: string
+    partCount: number
+    chunkSize: number
+    size: number
+    uploadUrls: string[]
+  } {
+    try {
+      const session = JSON.parse(
+        Buffer.from(token, "base64").toString("utf8"),
+      )
+      if (
+        !session ||
+        !session.fileId ||
+        !session.uploadId ||
+        !Number.isInteger(session.partCount) ||
+        session.partCount < 1 ||
+        !Array.isArray(session.uploadUrls)
+      ) {
+        throw new Error("invalid upload session")
+      }
+      return session
+    } catch {
+      throw new Error("[AliyundriveOpen] 上传会话无效或已损坏")
+    }
+  }
+
+  /**
+   * 解析物理目录路径 -> file_id（分片上传定位父目录用）。
+   *
+   * 与 driver.ts 的 resolveFileId 分开实现：这里只在本类内部使用，
+   * 不共享 driver 侧的 pathFileIdCache，避免两个缓存互相污染。
+   */
+  private async resolveFolderId(physicalPath: string): Promise<string> {
+    const clean = String(physicalPath || "/")
+      .split("/")
+      .filter(Boolean)
+      .join("/")
+    if (!clean) return this.getRootFolderId()
+    const parts = clean.split("/")
+    let currentId = this.getRootFolderId()
+    for (const part of parts) {
+      const decodedPart = (() => {
+        try {
+          return decodeURIComponent(part)
+        } catch {
+          return part
+        }
+      })()
+      const items = await this.listFiles(currentId)
+      const target = items.find(
+        (f: any) =>
+          f.name === part || f.name === decodedPart || f.file_id === part,
+      )
+      if (!target) {
+        throw new Error(`[AliyundriveOpen] 父目录不存在: ${physicalPath}`)
+      }
+      currentId = target.file_id
+    }
+    return currentId
+  }
 }

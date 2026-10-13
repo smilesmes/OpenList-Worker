@@ -434,6 +434,16 @@ publicRouter.get("/settings", async (c) => {
     // --- Display ---
     show_disk_usage_in_plain_text: "false",
     non_efs_zip_encoding: "UTF-8",
+    // --- Upload ---
+    // 前端 uploads.ts 用 getSettingBool("multipart_enabled") 决定是否启用
+    // Multipart 分片上传器；缺失时该上传器不可用，会回退到 Stream（整文件
+    // PUT /fs/put），大文件随即撞上 MAX_UPLOAD 上限。
+    // 后端 /fs/multipart/* 与驱动的 createUploadSession 都已就绪，这里只是
+    // 把开关暴露给前端。
+    multipart_enabled: "true",
+    // 分片大小（MB）。前端用它作为切片大小，后端会 clampChunkSize 到
+    // [1MB, 64MB]。10MB 远低于 CDN 请求体上限，是安全选择。
+    multipart_chunk_size: "10",
   }
 
   // FIX(C-1 / F-14): explicit allowlist — this endpoint is unauthenticated.

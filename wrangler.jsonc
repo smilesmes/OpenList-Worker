@@ -162,7 +162,7 @@
   //   省略 database_id 时，wrangler >= 4.45.0 会自动创建同名库并回写
   //
   // "d1_databases": [
-  //   { "binding": "DB", "database_name": "openlist", "database_id": "" }
+  //   { "binding": "DB", "database_name": "openlist", "database_id": "c1baa8ac-4fbb-40e9-b415-549c5e50941b" }
   // ],
   //
   // ▶ 方案 C：Durable Objects（内置 SQLite，强一致；DB_FORMAT 建议改为 "sql"）

@@ -1434,6 +1434,7 @@ fsRouter.post("/multipart/init", async (c) => {
         name,
         size,
         md5,
+        chunkSize, // hint：让网盘侧分片大小与会话 chunk_size 一致
       )
       session = {
         upload_id: newUploadId(),

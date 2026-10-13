@@ -433,6 +433,7 @@ export class AliyunOpenClient {
     physicalDir: string,
     fileName: string,
     size: number,
+    hintChunkSize = 0,
   ): Promise<{
     reuse: boolean
     partCount: number
@@ -444,7 +445,16 @@ export class AliyunOpenClient {
       await this.resolveDriveId()
     }
     const parentFileId = await this.resolveFolderId(physicalDir || "/")
-    const partSize = AliyunOpenClient.calPartSize(size)
+    // 切片大小：优先用调用方建议（后端 multipart 会话的 chunk_size，
+    // 保证「会话记账」与「网盘侧分片」一致）；否则退回上游默认 20MB。
+    // clamp 到 [5MB, 100MB]：低于 5MB 阿里云盘拒绝，高于 100MB 撞
+    // MAX_UPPART（16MB 默认）与 Worker 内存上限，没有意义。
+    const MB = 1024 * 1024
+    const hint = Math.floor(Number(hintChunkSize) || 0)
+    const partSize =
+      hint >= 5 * MB && hint <= 100 * MB
+        ? hint
+        : AliyunOpenClient.calPartSize(size)
     const partCount = Math.max(1, Math.ceil(size / partSize))
 
     const createResp = await this.openApiRequest<any>("/openFile/create", {
